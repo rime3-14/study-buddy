@@ -1,12 +1,11 @@
 """Small study API for investigating LLM behavior with Datadog."""
 
 import os
-from contextlib import asynccontextmanager, contextmanager
-from functools import lru_cache
+from contextlib import nullcontext
 from typing import Annotated, Literal
 
 from ddtrace.llmobs import LLMObs
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from openai import APIError, APITimeoutError, OpenAI, RateLimitError
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
@@ -34,10 +33,6 @@ class Flashcards(BaseModel):
     flashcards: list[Flashcard] = Field(min_length=5, max_length=5)
 
 
-class QuizDraft(Flashcard):
-    pass
-
-
 class SelfCheck(BaseModel):
     model_config = ConfigDict(extra="forbid")
     verdict: Literal["supported", "unsupported", "uncertain"]
@@ -54,38 +49,29 @@ class InvalidModelOutput(Exception):
     """The provider succeeded, but its output does not meet our contract."""
 
 
-class MissingConfiguration(Exception):
-    pass
-
-
-@lru_cache
-def get_client() -> OpenAI:
+def get_client():
+    """Share one client across a request's calls, then close it."""
     key = os.getenv("GEMINI_API_KEY", "").strip()
     if not key:
-        raise MissingConfiguration("Set GEMINI_API_KEY in your local .env file.")
-    return OpenAI(
+        raise HTTPException(503, "Set GEMINI_API_KEY in your local .env file.")
+    with OpenAI(
         api_key=key,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         timeout=30.0,
         max_retries=0,  # Make individual failures and their latency interpretable.
-    )
+    ) as client:
+        yield client
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-    if get_client.cache_info().currsize:
-        get_client().close()
-        get_client.cache_clear()
-
-
-app = FastAPI(title="Study Buddy", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="Study Buddy",
+    swagger_ui_parameters={
+        "defaultModelsExpandDepth": -1,  # Hide the schema catalogue.
+        "docExpansion": "list",  # Start with just the three endpoint rows.
+        "tryItOutEnabled": True,
+    },
+)
 Client = Annotated[OpenAI, Depends(get_client)]
-
-
-@app.exception_handler(MissingConfiguration)
-async def missing_configuration_handler(request, exc):
-    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.exception_handler(InvalidModelOutput)
@@ -105,16 +91,9 @@ async def provider_error_handler(request, exc):
     return JSONResponse(status_code=status, content={"detail": detail})
 
 
-@contextmanager
 def workflow(name: str):
-    # Auto-instrumentation captures SDK calls. This parent groups the quiz's
-    # two calls and records application validation failures after an LLM 200.
-    if LLMObs.enabled:
-        with LLMObs.workflow(name=name):
-            LLMObs.annotate(tags={"endpoint": name, "provider_route": "gemini-openai-compatible"})
-            yield
-    else:
-        yield
+    """Group model calls and validation errors when tracing is enabled."""
+    return LLMObs.workflow(name=name) if LLMObs.enabled else nullcontext()
 
 
 def complete(client: OpenAI, instruction: str, content: str) -> str:
@@ -146,19 +125,19 @@ def parse_output(schema: type[BaseModel], raw: str):
         raise InvalidModelOutput(f"The model returned invalid {schema.__name__} JSON.") from None
 
 
-@app.get("/")
+@app.get("/", include_in_schema=False)
 def root():
     """Liveness only; this does not check provider or Datadog connectivity."""
     return {"status": "ok", "endpoints": ["/summarize", "/flashcards", "/quiz"]}
 
 
-@app.post("/summarize", response_model=Summary)
+@app.post("/summarize", response_model=Summary, summary="Summarize notes")
 def summarize(notes: NotesInput, client: Client):
     with workflow("summarize"):
         return Summary(summary=complete(client, "Summarize these notes in three sentences.", notes.text))
 
 
-@app.post("/flashcards", response_model=Flashcards)
+@app.post("/flashcards", response_model=Flashcards, summary="Create five flashcards")
 def flashcards(notes: NotesInput, client: Client):
     with workflow("flashcards"):
         raw = complete(
@@ -171,11 +150,11 @@ def flashcards(notes: NotesInput, client: Client):
         return parse_output(Flashcards, raw)
 
 
-@app.post("/quiz", response_model=Quiz)
+@app.post("/quiz", response_model=Quiz, summary="Create and check a quiz question")
 def quiz(notes: NotesInput, client: Client):
     with workflow("quiz"):
         draft = parse_output(
-            QuizDraft,
+            Flashcard,
             complete(
                 client,
                 "Create one quiz question and its answer using only the notes. Return only JSON "
