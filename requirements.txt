@@ -1,0 +1,6 @@
+fastapi==0.142.2
+uvicorn==0.54.0
+openai==3.22.1
+pydantic==2.13.5
+ddtrace==4.15.4
+python-dotenv[cli]>=1.0,<2
